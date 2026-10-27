@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""qsum [file|-] [--focus "..."] [--verify] [--chunk N]  Extractive digest of text through a local OpenAI-compatible endpoint.
+The model is told to copy lines verbatim and never interpret; a check reports quoted lines that are not in the input.
+Endpoints tried in order, 3 s probe of /v1/models each: $QSUM_ENDPOINT, then the comma separated $QSUM_FALLBACKS,
+default http://127.0.0.1:8080. Model id from /v1/models ($QSUM_MODEL overrides). $QSUM_KEY is an optional bearer token.
+The verify check runs with --verify and on a random 20% of calls; mismatches are logged to $QSUM_VERIFY_LOG
+(default ~/.cache/qsum/verify.log). Standard library only."""
+import sys, os, re, random, time, argparse, json, urllib.request
+
+ap = argparse.ArgumentParser(); ap.add_argument("file", nargs="?", default="-"); ap.add_argument("--focus", default=""); ap.add_argument("--verify", action="store_true")
+ap.add_argument("--chunk", type=int, default=9000, help="chars per chunk")
+a = ap.parse_args()
+txt = sys.stdin.read() if a.file == "-" else open(a.file, errors="replace").read()
+SYS = ("You are an extractor, not an analyst. Output ONLY bullet lines copied VERBATIM from the input, each exactly as one line of the input (no edits, no ellipsis, no paraphrase). "
+       "Over-include: every error, warning, failure, number, path, name, version, decision and timestamp-bearing event line. Never draw conclusions, never explain, never summarize in your own words. "
+       "Group nothing. If a line is repeated, quote it once and add ' (xN)' after it only on a separate note line starting 'NOTE:'.")
+KEY = os.environ.get("QSUM_KEY") or None
+ENDPOINTS = [e.strip() for e in [os.environ.get("QSUM_ENDPOINT", "")] + os.environ.get("QSUM_FALLBACKS", "http://127.0.0.1:8080").split(",") if e.strip()]
+VLOG = os.environ.get("QSUM_VERIFY_LOG") or os.path.expanduser("~/.cache/qsum/verify.log")
+def _base(e):
+    e = e.rstrip("/")
+    return e if e.endswith("/v1") else e + "/v1"
+def _get(url, timeout):
+    h = {"Authorization": "Bearer " + KEY} if KEY else {}
+    return json.load(urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout))
+def pick():
+    for e in ENDPOINTS:
+        base = _base(e)
+        try:
+            ids = [m["id"] for m in _get(base + "/models", 3).get("data", [])]
+        except Exception as ex:
+            print(f"qsum: {e} no answer ({type(ex).__name__}), next", file=sys.stderr); continue
+        return base, os.environ.get("QSUM_MODEL") or (ids[0] if ids else "default")
+    sys.exit("qsum: no endpoint answered (tried " + ", ".join(ENDPOINTS) + ")")
+BASE, MODEL = pick()
+def ask(p):
+    b = json.dumps({"model": MODEL, "messages": [{"role": "system", "content": SYS}, {"role": "user", "content": p}], "max_tokens": 2000, "temperature": 0.1,
+                    "chat_template_kwargs": {"enable_thinking": False}}).encode()
+    h = {"Content-Type": "application/json"}
+    if KEY: h["Authorization"] = "Bearer " + KEY
+    return json.load(urllib.request.urlopen(urllib.request.Request(BASE + "/chat/completions", b, h), timeout=900))["choices"][0]["message"]["content"]
+lines = txt.split("\n"); chunks = []; cur = ""
+for l in lines:
+    if len(cur) + len(l) > a.chunk and cur: chunks.append(cur); cur = ""
+    cur += l[:2000] + "\n"
+if cur.strip(): chunks.append(cur)
+out = []
+for i, c in enumerate(chunks):
+    p = (f"FOCUS: {a.focus}\n" if a.focus else "") + f"INPUT (part {i+1}/{len(chunks)}):\n{c}"
+    try: out.append(ask(p))
+    except Exception as e: sys.exit(f"qsum: endpoint {BASE} failed: {e}")
+res = "\n".join(out); print(res)
+if a.verify or random.random() < 0.2:
+    norm = lambda s: re.sub(r"\s+", " ", s).strip()
+    hay = norm(txt); bad = []
+    for l in res.split("\n"):
+        q = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", l).strip().strip("`\"'")
+        if len(q) < 8 or q.startswith("NOTE:"): continue
+        q = re.sub(r"\s*\(x\d+\)$", "", q)
+        if norm(q) not in hay: bad.append(q)
+    n = sum(1 for l in res.split("\n") if len(l.strip()) >= 8)
+    try:
+        os.makedirs(os.path.dirname(VLOG), exist_ok=True)
+        with open(VLOG, "a") as f:
+            f.write(f"{time.strftime('%F %T')} {a.file} lines={n} mismatches={len(bad)}\n" + "".join(f"  MISSING: {b[:200]}\n" for b in bad))
+    except OSError: pass
+    if bad: print(f"qsum: WARNING {len(bad)}/{n} quoted lines not found in input (see " + VLOG + ")", file=sys.stderr)
+    elif a.verify: print(f"qsum: verify OK, {n} lines all present in input", file=sys.stderr)
