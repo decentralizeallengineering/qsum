@@ -1,5 +1,7 @@
 # qsum
 
+[![tests](https://github.com/decentralizeallengineering/qsum/actions/workflows/tests.yml/badge.svg)](https://github.com/decentralizeallengineering/qsum/actions/workflows/tests.yml) ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
+
 An extractive digest of long text (logs, command output) through a local OpenAI-compatible chat endpoint such as
 llama.cpp or vLLM. The model is instructed to copy the important lines verbatim and never interpret; qsum then checks
 that every quoted line really occurs in the input and warns about any that do not. It exists to keep large outputs out
